@@ -70,14 +70,14 @@ ArrowGame/
 ├── AI使用记录.md           # AI 辅助开发的详细记录（需求对齐、Bug修复、UI美化）
 ├── 测试记录.md             # 游戏测试用例与结果记录
 ├── README.md              # 项目说明文档
-├── requirements.txt       # 项目依赖（如没有，可手动创建）
+├── requirements.txt       # 项目依赖
 └── images/                # 游戏截图文件夹
     ├── start_screen.png
     ├── game_play.png
     ├── level_complete.png
     ├── game_over.png
     └── game_win.png
-```
+
 
 ## 🎓 开发心得与AI辅助
 
