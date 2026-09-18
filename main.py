@@ -2,29 +2,52 @@
 
 """
 ============================================================
-《一箭又一箭》—— 现代极简风 UI 版本
+《一箭又一箭》—— 现代极简风 UI 版本（粒子 + 音效 + 过渡版）
 ============================================================
 
 玩法回顾：
     1. 10 × 10 棋盘，格子里放着箭头。
     2. 方向编码：0 = 空，1 = ↑，2 = ↓，3 = ←，4 = →。
     3. 鼠标点击箭头：
-         · 前方同行 / 同列没有其他箭头 → 箭头飞出棋盘。
-         · 前方有箭头阻挡             → 方块变红并抖动，失误 -1。
+         · 前方同行 / 同列没有其他箭头 → 箭头飞出棋盘 + 粒子爆开 + "嗖"音效。
+         · 前方有箭头阻挡             → 方块变红并抖动，失误 -1 + "咚"音效。
     4. 失误次数扣完 → 失败。
-    5. 所有箭头全部飞出屏幕 → 通关。
+    5. 所有箭头全部飞出屏幕 → 单关通关；若已是最后一关 → 全部通关。
 
 UI 设计要点：
     · 窗口 1000 × 700，背景米白 (249, 249, 246)
+    · 背景叠加超大号棋盘格纹理（极浅灰），只增加质感不喧宾夺主
     · 左侧 10 × 10 棋盘，格子是带圆角的浅色方块，格间留 3px
+    · 鼠标悬停在箭头格子上时：底色略变暗 + 箭头放大 1.05 倍
     · 右侧浅灰圆角数据面板，显示关卡 / 剩余箭头 / 剩余失误（红心）
-    · 按钮统一深灰绿 (47, 79, 79)，鼠标悬停时颜色变浅
+    · 按钮统一深灰绿 (47, 79, 79)，鼠标悬停时颜色变浅并轻微放大
     · 箭头使用四种柔和色：薄荷绿 / 浅琥珀 / 天蓝 / 珊瑚粉
+
+粒子系统：
+    · 点击成功时，在箭头格子中心爆出 10 个与箭头同色的小粒子
+    · 粒子随机向四周飞散，半径逐渐变小、透明度逐渐降低
+    · 约 0.5 秒后消失
+
+音效系统：
+    · 使用 Python 标准库在内存中合成波形，无需任何外部音频文件
+    · 成功飞出 → 400Hz→1200Hz 短促上升扫频 "嗖"
+    · 被阻挡   → 200Hz 低频指数衰减 "咚"
+    · 若系统无法初始化 mixer，游戏会自动静音运行，不会崩溃
+
+屏幕淡入过渡：
+    · 从“游戏中”切换到“失败 / 通关 / 全部通关”时，
+      叠一层黑色遮罩，0.3 秒内由全黑渐渐消失。
+    · 新增“全部通关”（complete）状态：第 5 关清空所有箭头后进入。
 ============================================================
 """
 
 import sys
 import math
+import random
+import io
+import wave
+import array
+
 import pygame
 
 
@@ -70,6 +93,7 @@ clock = pygame.time.Clock()
 # ============================================================
 
 BG_COLOR = (249, 249, 246)                  # 整体米白背景
+BG_CHECK_COLOR = (243, 243, 239)            # 背景棋盘格：更浅的灰（仅作纹理）
 EMPTY_CELL_COLOR = (238, 237, 232)          # 空格子：非常浅的灰
 PANEL_COLOR = (238, 237, 231)               # 右侧面板底色：浅灰
 CARD_COLOR = (255, 255, 255)                # 面板里的白色卡片
@@ -133,6 +157,9 @@ PANEL_BTN_FONT = load_font(22, bold=True)   # 面板按钮文字
 
 # 开始 / 失败 / 通关界面共用的居中主按钮
 MAIN_BTN_RECT = pygame.Rect(370, 416, 260, 68)
+
+# “全部通关”界面的“返回首页”按钮（位置比主按钮更靠下）
+COMPLETE_BTN = pygame.Rect(370, 500, 260, 68)
 
 # 游戏中右侧面板底部的两个按钮
 RESTART_BTN = pygame.Rect(
@@ -265,7 +292,8 @@ current_level = 1                           # 当前关卡编号（1 开始）
 board = [row[:] for row in level1]          # 当前运行的棋盘
 mistakes_left = 3                           # 剩余失误机会
 
-game_state = "start"                        # start / playing / lose / win
+# 状态机：start / playing / lose / win / complete
+game_state = "start"
 
 flying_arrows = []                          # 正在飞出的箭头列表
 blocked_fx = {}                             # 被阻挡的抖动动画：{(row, col): 起始时间}
@@ -273,70 +301,416 @@ blocked_fx = {}                             # 被阻挡的抖动动画：{(row, 
 FLY_SPEED = 15                              # 箭头每帧飞出速度（像素）
 BLOCK_DURATION = 420                        # 被阻挡抖动持续时间（毫秒）
 
+# ---------- 粒子系统 ----------
+particles = []                              # 当前存活的所有粒子
+
+# ---------- 屏幕淡入过渡 ----------
+# transition_alpha：黑色遮罩的不透明度（0~255），255 = 全黑
+# transition_start：遮罩开始淡出的时间戳（毫秒）
+TRANSITION_DURATION = 300                   # 过渡总时长：0.3 秒
+transition_alpha = 0.0
+transition_start = 0
+_transition_surface = None                  # 复用的黑色遮罩 Surface
+
 
 # ============================================================
-# 八、通用绘制工具
+# 八、屏幕淡入过渡
 # ============================================================
+
+def start_transition():
+    """
+    启动一次“屏幕淡入”过渡。
+
+    做法：状态切换的瞬间，让一层黑色遮罩从全黑（alpha=255）
+    慢慢消失到全透明。视觉上就像新界面从黑色里浮现出来。
+    """
+    global transition_alpha, transition_start
+    transition_alpha = 255.0
+    transition_start = pygame.time.get_ticks()
+
+
+def update_transition():
+    """
+    每帧更新遮罩透明度。
+
+    用线性插值：elapsed 从 0 走到 TRANSITION_DURATION 时，
+    alpha 从 255 线性降到 0。
+    """
+    global transition_alpha
+
+    if transition_alpha <= 0.0:
+        return
+
+    elapsed = pygame.time.get_ticks() - transition_start
+    if elapsed >= TRANSITION_DURATION:
+        transition_alpha = 0.0
+    else:
+        transition_alpha = 255.0 * (1.0 - elapsed / TRANSITION_DURATION)
+
+
+def draw_transition_overlay():
+    """
+    把黑色遮罩叠在所有 UI 之上。
+
+    遮罩 Surface 只在第一次使用时创建，之后每帧仅调整 alpha，
+    避免重复创建 Surface 造成的性能开销。
+    """
+    global _transition_surface
+
+    if transition_alpha <= 0.5:
+        return
+
+    if _transition_surface is None:
+        _transition_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
+        _transition_surface.fill((0, 0, 0))
+
+    _transition_surface.set_alpha(int(transition_alpha))
+    screen.blit(_transition_surface, (0, 0))
+
+
+# ============================================================
+# 九、音效系统（内存合成，无需外部文件）
+# ============================================================
+
+# 两个全局 Sound 对象；如果 mixer 初始化失败会保持为 None
+sfx_fly = None
+sfx_hit = None
+
+
+def _synthesize_wav(samples, sample_rate, channels=1):
+    """
+    把 -1.0 ~ 1.0 的浮点采样打包成 16 位 PCM 的 WAV 字节流。
+    """
+    buf = io.BytesIO()
+
+    with wave.open(buf, 'wb') as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(2)             # 16 位 = 2 字节
+        wav.setframerate(sample_rate)
+
+        pcm = array.array('h')
+        for s in samples:
+            if s > 1.0:
+                s = 1.0
+            elif s < -1.0:
+                s = -1.0
+            v = int(s * 32767)
+            pcm.append(v)
+            if channels == 2:
+                pcm.append(v)
+
+        wav.writeframes(pcm.tobytes())
+
+    buf.seek(0)
+    return buf
+
+
+def _generate_sine_sweep(f_start, f_end, duration,
+                         sample_rate, volume=0.4):
+    """生成一段频率线性扫变的“嗖”音效。"""
+    n = int(sample_rate * duration)
+    samples = []
+    phase = 0.0
+
+    for i in range(n):
+        t = i / n
+        freq = f_start + (f_end - f_start) * t
+        phase += 2.0 * math.pi * freq / sample_rate
+
+        # 淡入淡出包络，避免爆音
+        attack = 0.02
+        release = 0.35
+        if t < attack:
+            env = t / attack
+        elif t > 1.0 - release:
+            env = (1.0 - t) / release
+        else:
+            env = 1.0
+
+        samples.append(math.sin(phase) * env * volume)
+
+    return samples
+
+
+def _generate_hit(freq, duration, sample_rate, volume=0.55):
+    """生成一段低频“咚”的撞击音效。"""
+    n = int(sample_rate * duration)
+    samples = []
+    phase = 0.0
+
+    for i in range(n):
+        t = i / n
+        f = freq * (1.0 - 0.4 * t)
+        phase += 2.0 * math.pi * f / sample_rate
+
+        wave_val = math.sin(phase) * 0.85 + math.sin(phase * 2.0) * 0.15
+        env = math.exp(-t * 8.0) * (1.0 - t)
+        samples.append(wave_val * env * volume)
+
+    return samples
+
+
+def init_sounds():
+    """
+    初始化音效系统：
+        · 尝试初始化 mixer
+        · 查询 mixer 实际采样率与声道
+        · 合成“嗖”与“咚”两个 Sound
+    失败时自动转为静音模式，不崩溃。
+    """
+    global sfx_fly, sfx_hit
+
+    try:
+        if pygame.mixer.get_init() is None:
+            pygame.mixer.init(
+                frequency=44100,
+                size=-16,
+                channels=2,
+                buffer=512,
+            )
+    except pygame.error as e:
+        print(f"[音效] 音频设备初始化失败，将以静音模式运行：{e}")
+        return
+
+    got = pygame.mixer.get_init()
+    if got is None:
+        print("[音效] mixer 未初始化，将以静音模式运行。")
+        return
+
+    sample_rate, _, channels = got
+
+    # ---------- 1. 飞出音效：400Hz → 1200Hz，0.15 秒 ----------
+    sweep_samples = _generate_sine_sweep(
+        f_start=400.0,
+        f_end=1200.0,
+        duration=0.15,
+        sample_rate=sample_rate,
+        volume=0.35,
+    )
+    sweep_buf = _synthesize_wav(sweep_samples, sample_rate, channels)
+    sfx_fly = pygame.mixer.Sound(file=sweep_buf)
+
+    # ---------- 2. 撞击音效：200Hz 指数衰减，0.22 秒 ----------
+    hit_samples = _generate_hit(
+        freq=200.0,
+        duration=0.22,
+        sample_rate=sample_rate,
+        volume=0.55,
+    )
+    hit_buf = _synthesize_wav(hit_samples, sample_rate, channels)
+    sfx_hit = pygame.mixer.Sound(file=hit_buf)
+
+
+def play_sfx(sound):
+    """安全播放音效；sound 为 None 时静默忽略。"""
+    if sound is not None:
+        sound.play()
+
+
+# 立即初始化音效
+init_sounds()
+
+
+# ============================================================
+# 十、粒子系统
+# ============================================================
+
+class Particle:
+    """
+    单个小粒子。
+
+    使用位置、速度、半径、透明度和年龄等简单属性来描述，
+    每帧根据 dt（帧间隔秒数）进行物理更新：
+
+        · 位置       → 按速度 × dt 位移
+        · 速度       → 每帧轻微衰减（阻尼），使飞散更柔和
+        · 半径       → 从初始半径线性收缩到 0
+        · 透明度     → 从 255 线性衰减到 0
+        · 存活时间   → 超过 lifetime 秒后自动标记死亡
+    """
+
+    def __init__(self, x, y, color):
+        self.x = float(x)
+        self.y = float(y)
+        self.color = color
+
+        # 随机方向 + 随机初速度（像素/秒）
+        angle = random.uniform(0.0, math.tau)
+        speed = random.uniform(90.0, 200.0)
+        self.vx = math.cos(angle) * speed
+        self.vy = math.sin(angle) * speed
+
+        # 随机初始半径
+        self.start_radius = random.uniform(2.5, 5.0)
+        self.radius = self.start_radius
+
+        # 生命周期：约 0.5 秒
+        self.age = 0.0
+        self.lifetime = 0.5
+        self.alpha = 255.0
+        self.alive = True
+
+    def update(self, dt):
+        """根据帧间隔 dt（秒）更新粒子状态。"""
+        if not self.alive:
+            return
+
+        self.age += dt
+        if self.age >= self.lifetime:
+            self.alive = False
+            return
+
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+
+        # 与帧率无关的阻尼
+        damping = 0.90 ** (dt * 60.0)
+        self.vx *= damping
+        self.vy *= damping
+
+        t = self.age / self.lifetime
+        self.radius = self.start_radius * (1.0 - t)
+        self.alpha = 255.0 * (1.0 - t)
+
+    def draw(self, surface):
+        """把粒子画到目标 Surface 上（带透明度）。"""
+        r = int(round(self.radius))
+        a = int(self.alpha)
+        if r < 1 or a <= 0:
+            return
+
+        size = r * 2 + 2
+        temp = pygame.Surface((size, size), pygame.SRCALPHA)
+        pygame.draw.circle(
+            temp,
+            (self.color[0], self.color[1], self.color[2], a),
+            (size // 2, size // 2),
+            r
+        )
+        surface.blit(temp, (self.x - size // 2, self.y - size // 2))
+
+
+def spawn_particles(x, y, color, count=10):
+    """在指定位置生成若干个粒子。"""
+    for _ in range(count):
+        particles.append(Particle(x, y, color))
+
+
+def update_particles(dt):
+    """每帧更新所有粒子，并移除已经死亡的粒子。"""
+    for p in particles[:]:
+        p.update(dt)
+        if not p.alive:
+            particles.remove(p)
+
+
+def draw_particles():
+    """把所有存活的粒子绘制到屏幕上。"""
+    for p in particles:
+        p.draw(screen)
+
+
+# ============================================================
+# 十一、通用绘制工具
+# ============================================================
+
+# 背景棋盘格纹理缓存
+_bg_surface = None
+
+
+def draw_background():
+    """
+    绘制整体背景：米白色底 + 超大号棋盘格纹理。
+    纹理一次性绘制到离屏 Surface 并缓存复用。
+    """
+    global _bg_surface
+
+    if _bg_surface is None:
+        _bg_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
+        _bg_surface.fill(BG_COLOR)
+
+        tile = 80
+        rows = WINDOW_HEIGHT // tile + 2
+        cols = WINDOW_WIDTH // tile + 2
+
+        for r in range(rows):
+            for c in range(cols):
+                if (r + c) % 2 == 0:
+                    pygame.draw.rect(
+                        _bg_surface,
+                        BG_CHECK_COLOR,
+                        (c * tile, r * tile, tile, tile)
+                    )
+
+    screen.blit(_bg_surface, (0, 0))
+
+
+def darken(color, factor=0.88):
+    """将颜色按比例变暗。"""
+    return (
+        max(0, int(color[0] * factor)),
+        max(0, int(color[1] * factor)),
+        max(0, int(color[2] * factor)),
+    )
+
 
 def draw_button(rect, text, font, radius=15):
     """
-    绘制一个圆角按钮。
-
-    鼠标悬停在按钮上时，颜色由深灰绿变为较浅的灰绿，
-    给玩家清晰的“可点击”反馈。
+    绘制一个圆角按钮，带两种悬停反馈：
+        · 颜色：深灰绿 → 较浅灰绿
+        · 大小：整体轻微放大 1.05 倍（smoothscale 平滑缩放）
     """
     hovered = rect.collidepoint(pygame.mouse.get_pos())
     color = BTN_HOVER_COLOR if hovered else BTN_COLOR
 
-    # 按钮主体（圆角矩形）
-    pygame.draw.rect(screen, color, rect, border_radius=radius)
+    if hovered:
+        scale = 1.05
+        w = int(rect.width * scale)
+        h = int(rect.height * scale)
 
-    # 按钮文字（居中）
-    text_surface = font.render(text, True, BTN_TEXT_COLOR)
-    screen.blit(text_surface, text_surface.get_rect(center=rect.center))
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.rect(surf, color, (0, 0, w, h), border_radius=radius)
+
+        text_surface = font.render(text, True, BTN_TEXT_COLOR)
+        surf.blit(text_surface, text_surface.get_rect(center=(w // 2, h // 2)))
+
+        surf = pygame.transform.smoothscale(surf, (w, h))
+        screen.blit(surf, surf.get_rect(center=rect.center))
+    else:
+        pygame.draw.rect(screen, color, rect, border_radius=radius)
+        text_surface = font.render(text, True, BTN_TEXT_COLOR)
+        screen.blit(text_surface, text_surface.get_rect(center=rect.center))
 
 
 def draw_arrow_icon(surface, cx, cy, direction, color, scale=1.0):
     """
-    在指定位置绘制一个箭头图形（默认白色）。
-
-    实现思路：
-        先定义“向上箭头”的 7 个顶点相对坐标，
-        再根据方向做旋转，得到最终的顶点坐标，
-        最后用 draw.polygon 一次性绘制出来。
-
-    参数：
-        surface  : 绘制目标 Surface
-        cx, cy   : 箭头中心坐标
-        direction: 1=上  2=下  3=左  4=右
-        color    : 箭头颜色
-        scale    : 缩放比例
+    在指定位置绘制一个箭头图形。
+    先用“向上箭头”的 7 个顶点做原型，再根据方向旋转。
     """
-    L = 16 * scale          # 中心到箭尖的距离
-    HL = 14 * scale         # 箭头三角头的长度
-    HW = 13 * scale         # 箭头三角头的半宽
-    SW = 5.5 * scale        # 箭杆的半宽
+    L = 16 * scale
+    HL = 14 * scale
+    HW = 13 * scale
+    SW = 5.5 * scale
 
-    # 以“向上箭头”为原型，记录 7 个顶点相对中心的偏移
     base_points = [
-        (0, -L),            # 箭尖
-        (HW, -L + HL),      # 三角头右下角
-        (SW, -L + HL),      # 箭杆右上
-        (SW, L),            # 箭杆右下
-        (-SW, L),           # 箭杆左下
-        (-SW, -L + HL),     # 箭杆左上
-        (-HW, -L + HL),     # 三角头左下角
+        (0, -L),
+        (HW, -L + HL),
+        (SW, -L + HL),
+        (SW, L),
+        (-SW, L),
+        (-SW, -L + HL),
+        (-HW, -L + HL),
     ]
 
     points = []
     for dx, dy in base_points:
-        if direction == 1:          # 向上：不旋转
+        if direction == 1:
             rx, ry = dx, dy
-        elif direction == 2:        # 向下：旋转 180°
+        elif direction == 2:
             rx, ry = -dx, -dy
-        elif direction == 3:        # 向左：逆时针旋转 90°
+        elif direction == 3:
             rx, ry = dy, -dx
-        else:                       # 向右：顺时针旋转 90°
+        else:
             rx, ry = -dy, dx
         points.append((cx + rx, cy + ry))
 
@@ -344,13 +718,9 @@ def draw_arrow_icon(surface, cx, cy, direction, color, scale=1.0):
 
 
 def draw_heart(surface, cx, cy, size, color):
-    """
-    用两个圆 + 一个三角形拼出一个爱心。
-    用于表示“剩余失误机会”。
-    """
+    """用两个圆 + 一个三角形拼出一个爱心。"""
     r = size * 0.27
 
-    # 左右两个圆
     pygame.draw.circle(
         surface, color,
         (int(cx - size * 0.22), int(cy - size * 0.14)),
@@ -362,7 +732,6 @@ def draw_heart(surface, cx, cy, size, color):
         int(r)
     )
 
-    # 下方三角形
     pygame.draw.polygon(
         surface, color,
         [
@@ -374,27 +743,29 @@ def draw_heart(surface, cx, cy, size, color):
 
 
 # ============================================================
-# 九、关卡加载与状态切换
+# 十二、关卡加载与状态切换
 # ============================================================
 
 def load_level(level_number):
     """
     加载指定关卡：
         · 复制一份关卡数据，避免破坏原始数组
-        · 重置失误次数、抖动动画、飞行动画
+        · 重置失误次数、抖动动画、飞行动画、粒子、过渡遮罩
         · 把游戏状态切换到 playing
     """
     global current_level, board, mistakes_left, game_state
+    global transition_alpha
 
     level_number = max(1, min(level_number, TOTAL_LEVELS))
     current_level = level_number
 
-    # 深拷贝二维数组
     board = [row[:] for row in levels[current_level - 1]]
 
     mistakes_left = 3
     blocked_fx.clear()
     flying_arrows.clear()
+    particles.clear()
+    transition_alpha = 0.0          # 进入新关卡时清空遮罩
 
     game_state = "playing"
 
@@ -410,11 +781,7 @@ def restart_current_level():
 
 
 def go_to_next_level():
-    """
-    通关后的“下一关”逻辑：
-        第 1～4 关 → 进入下一关
-        第 5 关    → 全部通关，回到第 1 关
-    """
+    """通关后的“下一关”逻辑：第 1～4 关进入下一关。"""
     if current_level < TOTAL_LEVELS:
         load_level(current_level + 1)
     else:
@@ -422,58 +789,36 @@ def go_to_next_level():
 
 
 # ============================================================
-# 十、游戏逻辑：统计与判定
+# 十三、游戏逻辑：统计与判定
 # ============================================================
 
 def count_arrows():
-    """
-    统计还没有完全飞出屏幕的箭头总数。
-
-    包含：
-        1. 仍在棋盘上的箭头
-        2. 正在飞行动画中的箭头
-
-    只有两者同时为 0，才算真正通关。
-    """
+    """统计还没完全飞出屏幕的箭头总数。"""
     count = 0
-
     for row in board:
         for cell in row:
             if cell != 0:
                 count += 1
-
     count += len(flying_arrows)
     return count
 
 
 def can_arrow_leave(row, col):
-    """
-    判断 (row, col) 处的箭头前方是否有其他箭头阻挡。
-
-    返回 True  → 前方畅通，可以飞出
-    返回 False → 前方有箭头，不能飞出
-    """
+    """判断 (row, col) 处的箭头前方是否有其他箭头阻挡。"""
     direction = board[row][col]
 
-    # ↑：检查同一列上方
     if direction == 1:
         for r in range(row - 1, -1, -1):
             if board[r][col] != 0:
                 return False
-
-    # ↓：检查同一列下方
     elif direction == 2:
         for r in range(row + 1, GRID_SIZE):
             if board[r][col] != 0:
                 return False
-
-    # ←：检查同一行左侧
     elif direction == 3:
         for c in range(col - 1, -1, -1):
             if board[row][c] != 0:
                 return False
-
-    # →：检查同一行右侧
     elif direction == 4:
         for c in range(col + 1, GRID_SIZE):
             if board[row][c] != 0:
@@ -483,28 +828,19 @@ def can_arrow_leave(row, col):
 
 
 # ============================================================
-# 十一、飞行动画更新
+# 十四、飞行动画更新
 # ============================================================
 
 def update_flying_arrows():
-    """
-    每帧更新所有正在飞出的箭头：
-
-        · 沿自身方向移动
-        · 随着飞行距离增加逐渐变淡
-        · 完全离开窗口后从列表中移除
-    """
+    """每帧更新所有正在飞出的箭头。"""
     for arrow in flying_arrows[:]:
-
         dx, dy = DIR_VEC[arrow["direction"]]
         arrow["x"] += dx * FLY_SPEED
         arrow["y"] += dy * FLY_SPEED
         arrow["dist"] += FLY_SPEED
 
-        # 越飞越透明（最低保留 60 的不透明度，避免突兀消失）
         arrow["alpha"] = max(60.0, 255.0 - arrow["dist"] * 0.36)
 
-        # 判断是否已经完全飞出窗口
         margin = CELL_SIZE
         out = (
             arrow["x"] < -margin
@@ -517,21 +853,14 @@ def update_flying_arrows():
 
 
 # ============================================================
-# 十二、开始界面
+# 十五、开始界面
 # ============================================================
 
 def draw_start_screen():
-    """
-    开始界面：
-        · 顶部四个彩色箭头方块作为装饰
-        · 居中大标题 + 副标题
-        · 深灰绿圆角“开始游戏”按钮
-    """
-    screen.fill(BG_COLOR)
+    """开始界面：装饰箭头 + 大标题 + 副标题 + 开始按钮。"""
+    draw_background()
 
-    # --------------------------------------------------------
     # 装饰：一排四个彩色箭头方块
-    # --------------------------------------------------------
     deco_size = 64
     deco_gap = 20
     total_w = 4 * deco_size + 3 * deco_gap
@@ -550,15 +879,9 @@ def draw_start_screen():
             direction, (255, 255, 255)
         )
 
-    # --------------------------------------------------------
-    # 大标题
-    # --------------------------------------------------------
     title = TITLE_FONT.render("一箭又一箭", True, TEXT_DARK)
     screen.blit(title, title.get_rect(center=(WINDOW_WIDTH // 2, 258)))
 
-    # --------------------------------------------------------
-    # 副标题
-    # --------------------------------------------------------
     subtitle = SUBTITLE_FONT.render(
         "点击箭头，让它们依次飞出棋盘", True, TEXT_SUB
     )
@@ -566,14 +889,8 @@ def draw_start_screen():
         subtitle, subtitle.get_rect(center=(WINDOW_WIDTH // 2, 330))
     )
 
-    # --------------------------------------------------------
-    # 开始游戏按钮
-    # --------------------------------------------------------
     draw_button(MAIN_BTN_RECT, "开始游戏", BUTTON_FONT)
 
-    # --------------------------------------------------------
-    # 底部小字提示
-    # --------------------------------------------------------
     tip = SMALL_FONT.render(
         f"共 {TOTAL_LEVELS} 个关卡  ·  每关 3 次失误机会", True, TEXT_SUB
     )
@@ -581,7 +898,7 @@ def draw_start_screen():
 
 
 # ============================================================
-# 十三、游戏界面：棋盘
+# 十六、游戏界面：棋盘
 # ============================================================
 
 def cell_topleft(row, col):
@@ -590,15 +907,16 @@ def cell_topleft(row, col):
 
 
 def draw_board():
-    """
-    绘制左侧 10 × 10 棋盘。
-
-    每个格子都是一块带圆角的方块：
-        · 空格子     → 非常浅的灰色
-        · 有箭头格子 → 对应方向的柔和色 + 白色箭头
-        · 被阻挡格子 → 浅红色 + 左右抖动
-    """
+    """绘制左侧 10 × 10 棋盘。"""
     now = pygame.time.get_ticks()
+
+    # 计算鼠标当前悬停的格子
+    mx, my = pygame.mouse.get_pos()
+    hover_row, hover_col = -1, -1
+    if (BOARD_X <= mx < BOARD_X + BOARD_PIXEL and
+            BOARD_Y <= my < BOARD_Y + BOARD_PIXEL):
+        hover_col = (mx - BOARD_X) // CELL_STEP
+        hover_row = (my - BOARD_Y) // CELL_STEP
 
     for row in range(GRID_SIZE):
         for col in range(GRID_SIZE):
@@ -607,14 +925,14 @@ def draw_board():
             direction = board[row][col]
             rect = pygame.Rect(x, y, CELL_SIZE, CELL_SIZE)
 
-            # ---------- 空格子 ----------
+            # 空格子
             if direction == 0:
                 pygame.draw.rect(
                     screen, EMPTY_CELL_COLOR, rect, border_radius=14
                 )
                 continue
 
-            # ---------- 判断是否处于“被阻挡”反馈中 ----------
+            # 被阻挡抖动
             blocked = False
             offset_x = 0
 
@@ -624,43 +942,47 @@ def draw_board():
                 if elapsed < BLOCK_DURATION:
                     blocked = True
                     progress = elapsed / BLOCK_DURATION
-                    # 衰减正弦波：左右摆动幅度逐渐减小
                     offset_x = (
                         math.sin(progress * math.pi * 6)
                         * 7
                         * (1 - progress)
                     )
                 else:
-                    # 动画结束，清除记录
                     del blocked_fx[(row, col)]
 
-            # ---------- 绘制方块 ----------
-            color = BLOCKED_COLOR if blocked else ARROW_COLORS[direction]
-            rect.x += int(offset_x)
-
-            pygame.draw.rect(screen, color, rect, border_radius=14)
-
-            # ---------- 绘制白色箭头 ----------
-            draw_arrow_icon(
-                screen, rect.centerx, rect.centery,
-                direction, (255, 255, 255)
+            # 鼠标悬停
+            is_hover = (
+                not blocked
+                and row == hover_row
+                and col == hover_col
             )
 
-    # --------------------------------------------------------
-    # 绘制正在飞出的箭头（带淡出效果）
-    # --------------------------------------------------------
+            # 方块颜色
+            if blocked:
+                color = BLOCKED_COLOR
+            elif is_hover:
+                color = darken(ARROW_COLORS[direction], 0.86)
+            else:
+                color = ARROW_COLORS[direction]
+
+            rect.x += int(offset_x)
+            pygame.draw.rect(screen, color, rect, border_radius=14)
+
+            # 白色箭头（悬停放大 1.05 倍）
+            arrow_scale = 1.05 if is_hover else 1.0
+            draw_arrow_icon(
+                screen, rect.centerx, rect.centery,
+                direction, (255, 255, 255),
+                scale=arrow_scale
+            )
+
+    # 飞出箭头
     for arrow in flying_arrows:
         draw_flying_arrow(arrow)
 
 
 def draw_flying_arrow(arrow):
-    """
-    绘制一个正在飞出的箭头。
-
-    使用一块带 Alpha 通道的临时 Surface 先画好
-    “圆角方块 + 白色箭头”，再整体设置透明度并贴到屏幕上，
-    从而实现平滑的淡出效果。
-    """
+    """绘制一个正在飞出的箭头（带淡出效果）。"""
     surf = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
 
     color = ARROW_COLORS[arrow["direction"]]
@@ -680,42 +1002,29 @@ def draw_flying_arrow(arrow):
 
 
 # ============================================================
-# 十四、游戏界面：右侧数据面板
+# 十七、游戏界面：右侧数据面板
 # ============================================================
 
 def draw_info_card(y, label, value):
-    """
-    绘制一张白色信息卡片。
-
-    参数：
-        y     : 卡片顶部 y 坐标
-        label : 小号灰色标签文字
-        value : 大号深灰绿数值文字
-    """
+    """绘制一张白色信息卡片（标签 + 数值）。"""
     rect = pygame.Rect(PANEL_X + 24, y, PANEL_W - 48, 105)
     pygame.draw.rect(screen, CARD_COLOR, rect, border_radius=18)
 
-    # 标签
     label_surf = LABEL_FONT.render(label, True, TEXT_SUB)
     screen.blit(label_surf, (rect.x + 20, rect.y + 16))
 
-    # 数值
     value_surf = VALUE_FONT.render(value, True, TEXT_DARK)
     screen.blit(value_surf, (rect.x + 20, rect.y + 52))
 
 
 def draw_hearts_card(y, label, hearts):
-    """
-    绘制“剩余失误”卡片，用红心表示剩余次数。
-    """
+    """绘制“剩余失误”卡片（红心数量表示剩余机会）。"""
     rect = pygame.Rect(PANEL_X + 24, y, PANEL_W - 48, 105)
     pygame.draw.rect(screen, CARD_COLOR, rect, border_radius=18)
 
-    # 标签
     label_surf = LABEL_FONT.render(label, True, TEXT_SUB)
     screen.blit(label_surf, (rect.x + 20, rect.y + 16))
 
-    # 三颗心，剩几颗就点亮几颗
     for i in range(3):
         cx = rect.x + 36 + i * 44
         cy = rect.y + 72
@@ -724,76 +1033,46 @@ def draw_hearts_card(y, label, hearts):
 
 
 def draw_panel():
-    """
-    绘制右侧浅灰圆角数据面板：
-        · 当前关卡
-        · 剩余箭头数
-        · 剩余失误机会（红心）
-        · 底部“重新开始”/“返回首页”按钮
-    """
-    # --------------------------------------------------------
-    # 面板底板
-    # --------------------------------------------------------
+    """绘制右侧浅灰圆角数据面板。"""
     panel_rect = pygame.Rect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H)
     pygame.draw.rect(screen, PANEL_COLOR, panel_rect, border_radius=24)
 
-    # --------------------------------------------------------
-    # 三张信息卡片
-    # --------------------------------------------------------
     card_y = PANEL_Y + 28
 
-    draw_info_card(
-        card_y,
-        "当前关卡",
-        f"{current_level} / {TOTAL_LEVELS}"
-    )
+    draw_info_card(card_y, "当前关卡", f"{current_level} / {TOTAL_LEVELS}")
+    draw_info_card(card_y + 120, "剩余箭头", f"{count_arrows()}")
+    draw_hearts_card(card_y + 240, "剩余失误", mistakes_left)
 
-    draw_info_card(
-        card_y + 120,
-        "剩余箭头",
-        f"{count_arrows()}"
-    )
-
-    draw_hearts_card(
-        card_y + 240,
-        "剩余失误",
-        mistakes_left
-    )
-
-    # --------------------------------------------------------
-    # 中间小提示文字
-    # --------------------------------------------------------
     tip1 = SMALL_FONT.render("点击箭头让它飞出棋盘", True, TEXT_SUB)
     tip2 = SMALL_FONT.render("前方有阻挡会扣除失误", True, TEXT_SUB)
 
-    screen.blit(
-        tip1, tip1.get_rect(center=(PANEL_X + PANEL_W // 2, 452))
-    )
-    screen.blit(
-        tip2, tip2.get_rect(center=(PANEL_X + PANEL_W // 2, 478))
-    )
+    screen.blit(tip1, tip1.get_rect(center=(PANEL_X + PANEL_W // 2, 452)))
+    screen.blit(tip2, tip2.get_rect(center=(PANEL_X + PANEL_W // 2, 478)))
 
-    # --------------------------------------------------------
-    # 底部按钮
-    # --------------------------------------------------------
     draw_button(RESTART_BTN, "重新开始", PANEL_BTN_FONT)
     draw_button(HOME_BTN, "返回首页", PANEL_BTN_FONT)
 
 
 def draw_game_screen():
-    """绘制完整的游戏画面：左侧棋盘 + 右侧面板。"""
-    screen.fill(BG_COLOR)
+    """完整游戏画面：背景 → 棋盘 → 粒子 → 右侧面板。"""
+    draw_background()
     draw_board()
+    draw_particles()
     draw_panel()
 
 
 # ============================================================
-# 十五、失败界面
+# 十八、失败界面
 # ============================================================
 
 def draw_lose_screen():
-    """失败界面：柔和红标题 + 重新开始按钮。"""
-    screen.fill(BG_COLOR)
+    """
+    失败界面（已去掉图标）：
+        · 柔和红标题
+        · 提示文字
+        · 重新开始按钮
+    """
+    draw_background()
 
     title = PAGE_TITLE_FONT.render("挑战失败", True, (226, 106, 106))
     screen.blit(title, title.get_rect(center=(WINDOW_WIDTH // 2, 240)))
@@ -807,69 +1086,70 @@ def draw_lose_screen():
 
 
 # ============================================================
-# 十六、通关界面
+# 十九、单关通关界面
 # ============================================================
 
 def draw_win_screen():
     """
-    通关界面：
-
-    第 1～4 关 → “通关” + “下一关”按钮
-    第 5 关    → “全部通关” + “重新开始”按钮
+    单关通关界面（第 1～4 关，已去掉图标）：
+        · “通关！” 标题
+        · “恭喜完成第 N 关”提示
+        · “下一关”按钮
     """
-    screen.fill(BG_COLOR)
+    draw_background()
 
-    # --------------------------------------------------------
-    # 标题
-    # --------------------------------------------------------
-    if current_level < TOTAL_LEVELS:
-        title_text = "通关！"
-        title_color = (95, 170, 120)
-    else:
-        title_text = "全部通关！"
-        title_color = (95, 170, 120)
-
-    title = PAGE_TITLE_FONT.render(title_text, True, title_color)
+    title = PAGE_TITLE_FONT.render("通关！", True, (95, 170, 120))
     screen.blit(title, title.get_rect(center=(WINDOW_WIDTH // 2, 240)))
 
-    # --------------------------------------------------------
-    # 提示文字
-    # --------------------------------------------------------
-    if current_level < TOTAL_LEVELS:
-        tip_text = f"恭喜完成第 {current_level} 关"
-        btn_text = "下一关"
-    else:
-        tip_text = f"你完成了全部 {TOTAL_LEVELS} 个关卡"
-        btn_text = "重新开始"
-
+    tip_text = f"恭喜完成第 {current_level} 关"
     tip = BODY_FONT.render(tip_text, True, TEXT_SUB)
     screen.blit(tip, tip.get_rect(center=(WINDOW_WIDTH // 2, 320)))
 
-    # --------------------------------------------------------
-    # 按钮
-    # --------------------------------------------------------
-    draw_button(MAIN_BTN_RECT, btn_text, BUTTON_FONT)
+    draw_button(MAIN_BTN_RECT, "下一关", BUTTON_FONT)
 
 
 # ============================================================
-# 十七、事件处理
+# 二十、全部通关界面（状态：complete）
+# ============================================================
+
+def draw_complete_screen():
+    """
+    全部通关界面（已去掉图标）：
+        · “恭喜通关！” 大标题
+        · “你完成了所有挑战！” 副标题
+        · “返回首页”按钮
+    """
+    draw_background()
+
+    title = PAGE_TITLE_FONT.render("恭喜通关！", True, TEXT_DARK)
+    screen.blit(title, title.get_rect(center=(WINDOW_WIDTH // 2, 240)))
+
+    tip = BODY_FONT.render(
+        "你完成了所有挑战！", True, TEXT_SUB
+    )
+    screen.blit(tip, tip.get_rect(center=(WINDOW_WIDTH // 2, 320)))
+
+    draw_button(COMPLETE_BTN, "返回首页", BUTTON_FONT)
+
+
+# ============================================================
+# 二十一、事件处理
 # ============================================================
 
 def handle_board_click(mx, my):
     """
     处理玩家点击棋盘的操作。
 
-    可以飞出  → 生成一个飞行动画对象，并从逻辑棋盘上移除该箭头
-    被阻挡   → 记录抖动动画，失误次数 -1
+    可以飞出  → 播放“嗖”音效 + 生成飞行动画 + 爆出同色粒子
+    被阻挡   → 播放“咚”音效 + 记录抖动动画，失误次数 -1
+               失误次数扣完 → 进入失败状态，同时启动淡入过渡
     """
     global mistakes_left, game_state
 
-    # 点击位置必须落在棋盘范围内
     if not (BOARD_X <= mx < BOARD_X + BOARD_PIXEL and
             BOARD_Y <= my < BOARD_Y + BOARD_PIXEL):
         return
 
-    # 换算成行列坐标
     col = (mx - BOARD_X) // CELL_STEP
     row = (my - BOARD_Y) // CELL_STEP
 
@@ -877,18 +1157,16 @@ def handle_board_click(mx, my):
         return
 
     direction = board[row][col]
-
-    # 点击空格，不处理
     if direction == 0:
         return
 
-    # --------------------------------------------------------
-    # 情况一：前方畅通，箭头飞出
-    # --------------------------------------------------------
+    # ---------- 情况一：前方畅通，箭头飞出 ----------
     if can_arrow_leave(row, col):
-
         cx = BOARD_X + col * CELL_STEP + CELL_SIZE // 2
         cy = BOARD_Y + row * CELL_STEP + CELL_SIZE // 2
+
+        play_sfx(sfx_fly)
+        spawn_particles(cx, cy, ARROW_COLORS[direction], count=10)
 
         flying_arrows.append({
             "x": float(cx),
@@ -898,26 +1176,23 @@ def handle_board_click(mx, my):
             "dist": 0.0,
         })
 
-        # 从逻辑棋盘移除，避免重复点击
         board[row][col] = 0
-
-        # 同时清除该格子上可能残留的抖动动画
         blocked_fx.pop((row, col), None)
 
-    # --------------------------------------------------------
-    # 情况二：前方有阻挡，扣一次失误
-    # --------------------------------------------------------
+    # ---------- 情况二：前方有阻挡，扣一次失误 ----------
     else:
+        play_sfx(sfx_hit)
         blocked_fx[(row, col)] = pygame.time.get_ticks()
 
         mistakes_left -= 1
         if mistakes_left <= 0:
             mistakes_left = 0
             game_state = "lose"
+            start_transition()      # 从“游戏中”到“失败”的屏幕淡入
 
 
 def handle_menu_click(mx, my):
-    """处理开始 / 失败 / 通关界面上的按钮点击。"""
+    """处理开始 / 失败 / 通关 / 全部通关界面上的按钮点击。"""
     global game_state
 
     # ---------- 开始界面 ----------
@@ -930,14 +1205,21 @@ def handle_menu_click(mx, my):
         if MAIN_BTN_RECT.collidepoint(mx, my):
             restart_current_level()
 
-    # ---------- 通关界面 ----------
+    # ---------- 单关通关界面 ----------
     elif game_state == "win":
         if MAIN_BTN_RECT.collidepoint(mx, my):
             go_to_next_level()
 
+    # ---------- 全部通关界面 ----------
+    elif game_state == "complete":
+        if COMPLETE_BTN.collidepoint(mx, my):
+            # 重置一切并回到首页
+            load_level(1)
+            game_state = "start"
+
 
 # ============================================================
-# 十八、主循环
+# 二十二、主循环
 # ============================================================
 
 def main():
@@ -948,16 +1230,22 @@ def main():
 
         start  ──开始游戏──▶  playing
                                 │
-                    失败 ◀──────┼──────▶ 通关
-                     │                   │
-                重新开始            下一关 / 重新开始
-                     │                   │
-                     ▼                   ▼
-                  playing             playing / start
+                失败 ◀──────────┼──────────▶ 通关 / 全部通关
+                 │              │              │
+            重新开始        （清空所有箭头）  下一关 / 返回首页
+                 │                             │
+                 ▼                             ▼
+              playing                    playing / start / complete
+
+    每当从 playing 切换到 lose / win / complete，
+    调用 start_transition() 启动屏幕淡入。
     """
     global game_state
 
     while True:
+
+        # 帧间隔（秒），用于粒子的时间相关更新
+        dt = clock.tick(FPS) / 1000.0
 
         # ====================================================
         # 1. 事件处理
@@ -972,11 +1260,14 @@ def main():
                 mx, my = event.pos
 
                 if game_state == "playing":
-                    # 优先检测右侧面板按钮
                     if RESTART_BTN.collidepoint(mx, my):
                         restart_current_level()
                     elif HOME_BTN.collidepoint(mx, my):
+                        # 回首页时清理所有动画 / 粒子，避免残留
                         game_state = "start"
+                        flying_arrows.clear()
+                        particles.clear()
+                        blocked_fx.clear()
                     else:
                         handle_board_click(mx, my)
                 else:
@@ -985,12 +1276,23 @@ def main():
         # ====================================================
         # 2. 逻辑更新
         # ====================================================
+        # 粒子在所有状态下都继续更新，这样即使切到胜利 / 失败界面，
+        # 残留的粒子也能自然淡出消失。
+        update_particles(dt)
+
         if game_state == "playing":
             update_flying_arrows()
 
             # 棋盘和飞行动画里都没有箭头了 → 通关
             if count_arrows() == 0:
-                game_state = "win"
+                if current_level < TOTAL_LEVELS:
+                    game_state = "win"
+                else:
+                    game_state = "complete"
+                start_transition()      # 从“游戏中”到“通关/全部通关”的屏幕淡入
+
+        # 更新过渡遮罩透明度（任何状态都执行）
+        update_transition()
 
         # ====================================================
         # 3. 画面绘制
@@ -1003,16 +1305,22 @@ def main():
             draw_lose_screen()
         elif game_state == "win":
             draw_win_screen()
+        elif game_state == "complete":
+            draw_complete_screen()
 
         # ====================================================
-        # 4. 刷新屏幕
+        # 4. 过渡遮罩画在最上层（覆盖所有 UI）
+        # ====================================================
+        draw_transition_overlay()
+
+        # ====================================================
+        # 5. 刷新屏幕
         # ====================================================
         pygame.display.flip()
-        clock.tick(FPS)
 
 
 # ============================================================
-# 十九、程序入口
+# 二十三、程序入口
 # ============================================================
 
 if __name__ == "__main__":
